@@ -576,13 +576,13 @@ impl WatchCommand {
                                 .status()
                                 .expect("failed to execute process");
                         if open {
-                            if exit_status.code() != Some(0) && !opened { 
+                            if exit_status.code() != Some(0) && !opened {
                                 /* TODO: check the file doesnt exist */
                                 /* TODO: open_document(out_file, status) */
                                 /* TODO: better to check if its open now or not */
                                 /* TODO: build as func to make it not call cli for these */
                                 /* TODO: where is opening file target exactly */
-                                // args = ["-X", "build", "--open"];   
+                                // args = ["-X", "build", "--open"];
                                 opened = true;
                                 open_document(
                                     env::current_dir().unwrap().join("build").join("default").join("default.pdf"),
@@ -600,7 +600,7 @@ impl WatchCommand {
                 EventType::Modify,
                 EventType::Remove
             ],
-            ignore: Some(env::current_dir().unwrap().join("build")),
+            ignore: vec!["./build".into()],
             ..Negahban::default()
         }.watch();
 
