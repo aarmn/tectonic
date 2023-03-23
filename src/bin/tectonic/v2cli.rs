@@ -4,7 +4,8 @@
 //! The "v2cli" command-line interface -- a "multitool" interface resembling
 //! Cargo, as compared to the classic "rustc-like" CLI.
 
-use std::{env, ffi::OsString, io::Write, path::PathBuf, process, str::FromStr};
+use std::{env, ffi::OsString, io::Write, path::PathBuf, process::{self, Command, ExitStatus}, str::FromStr};
+use negahban::{Negahban, HookType, hashset, EventType};
 use structopt::{clap::AppSettings, StructOpt};
 use tectonic::{
     self,
@@ -19,9 +20,8 @@ use tectonic::{
 use tectonic_bridge_core::{SecuritySettings, SecurityStance};
 use tectonic_bundles::Bundle;
 use tectonic_docmodel::workspace::{Workspace, WorkspaceCreator};
-use tectonic_errors::Error as NewError;
 use tectonic_status_base::plain::PlainStatusBackend;
-use watchexec::run::OnBusyUpdate;
+// use tectonic_errors::Error as NewError;
 
 /// The main options for the "V2" command-line interface.
 #[derive(Debug, StructOpt)]
@@ -229,10 +229,12 @@ pub struct BuildCommand {
     open: bool,
 }
 
+
 impl BuildCommand {
     fn customize(&self, _cc: &mut CommandCustomizations) {}
 
     fn execute(self, config: PersistentConfig, status: &mut dyn StatusBackend) -> Result<i32> {
+
         let ws = Workspace::open_from_environment()?;
         let doc = ws.first_document();
 
@@ -263,20 +265,7 @@ impl BuildCommand {
 
             if self.open {
                 let out_file = doc.output_main_file(output_name);
-
-                if is_config_test_mode_activated() {
-                    tt_note!(status, "not opening `{}` -- test mode", out_file.display());
-                } else {
-                    tt_note!(status, "opening `{}`", out_file.display());
-                    if let Err(e) = open::that(&out_file) {
-                        tt_error!(
-                            status,
-                            "failed to open `{}` with system handler",
-                            out_file.display();
-                            e.into()
-                        )
-                    }
-                }
+                open_document(out_file, status);
             }
         }
 
@@ -510,22 +499,46 @@ impl DumpCommand {
     }
 }
 
+/// Obtain the executable name without a prefix if the executable is available in the PATH, e.g.
+/// most cases. Otherwise, use the full path e.g. in development.
+pub(crate) fn get_trimmed_exe_name() -> PathBuf {
+    let exe_name = env::current_exe().expect("Get current executable name");
+
+    let path = std::env::var_os("PATH")
+        .or_else(|| std::env::var_os("Path"))
+        .or_else(|| std::env::var_os("path"))
+        .unwrap_or_default();
+
+    let paths = env::split_paths(&path).collect::<Vec<_>>();
+
+    for path in paths {
+        if let Ok(p) = exe_name.strip_prefix(&path) {
+            return p.to_owned();
+        }
+    }
+    exe_name
+}
+
 /// `watch`: Watch input files and execute commands on change
 #[derive(Debug, Eq, PartialEq, StructOpt)]
 pub struct WatchCommand {
     /// Tectonic commands to execute on build [default: build]
     #[structopt(long = "exec", short = "x")]
     execute: Vec<String>,
+
+    /// Open built document using system handler (relies on auto-reload)
+    #[structopt(long)]
+    open: bool,
 }
 
 impl WatchCommand {
     fn customize(&self, _cc: &mut CommandCustomizations) {}
 
-    fn execute(self, _config: PersistentConfig, status: &mut dyn StatusBackend) -> Result<i32> {
-        let exe_name = crate::watch::get_trimmed_exe_name()
+    fn execute(&self, _config: PersistentConfig, status: &mut dyn StatusBackend) -> Result<i32> {
+        let exe_name = get_trimmed_exe_name()
             .into_os_string()
-            .into_string()
-            .expect("Executable path wasn't valid UTF-8");
+            .into_string() // ?
+            .expect("Executable path wasn't valid UTF-8"); // ?
         let mut cmds = Vec::new();
         for x in self.execute.iter() {
             let mut cmd = format!("{exe_name} -X ");
@@ -536,53 +549,62 @@ impl WatchCommand {
             }
         }
 
-        if cmds.is_empty() {
-            cmds.push(format!("{exe_name} -X build"))
-        }
+        // let command = cmds.join(" && "); // ? What is this doing
+        let open = self.open.clone();
+        let mut opened = false;
 
-        let command = cmds.join(" && ");
-
-        let mut args = watchexec::config::ConfigBuilder::default();
-        let mut final_command = command.clone();
-        #[cfg(unix)]
-        final_command.push_str("; echo [Finished running. Exit status: $?]");
-        #[cfg(windows)]
-        {
-            final_command.push_str(" & echo [Finished running. Exit status: %ERRORLEVEL%]");
-            args.shell(watchexec::Shell::Cmd);
-        }
-        #[cfg(not(any(unix, windows)))]
-        final_command.push_str(" ; echo [Finished running]");
-
-        args.cmd(vec![final_command])
-            .paths(vec![env::current_dir()?])
-            .ignores(vec!["build".to_owned()])
-            .on_busy_update(OnBusyUpdate::Queue);
-        let args = args.build().map_err(NewError::from)?;
-
-        let exec_handler = watchexec::run::ExecHandler::new(args);
-        match exec_handler {
-            Err(e) => {
-                tt_error!(
-                    status,
-                    "failed to build arguments for watch ExecHandler";
-                    e.into()
-                );
-                Ok(1)
-            }
-            Ok(exec_handler) => {
-                let handler = crate::watch::Watcher {
-                    command,
-                    inner: exec_handler,
-                };
-                if let Err(e) = watchexec::watch(&handler) {
-                    tt_error!(status, "failed to execute watch"; e.into());
-                    Ok(1)
-                } else {
-                    Ok(0)
+        Negahban{
+            path: env::current_dir()?,
+            hook: HookType::IndefiniteHook(Box::new(
+                |_event| {
+                    let exit_status: ExitStatus;
+                    // if !cmds.is_empty(){
+                        // for cmd in cmds {
+                        //     status = Command::new("./script.sh")
+                        //         .status()
+                        //         .expect("failed to execute process");
+                        //     if status.code() != Some(0) {
+                        //         return // TODO:
+                        //     }
+                        // }
+                        /* TODO: how to manage conditions with cmds given */
+                    // }
+                    // else {
+                        let mut args = ["-X", "build", ""];
+                        exit_status = Command::new(format!("{exe_name}"))
+                                .args(args)
+                                .status()
+                                .expect("failed to execute process");
+                        if open {
+                            if exit_status.code() != Some(0) && !opened { 
+                                /* TODO: check the file doesnt exist */
+                                /* TODO: open_document(out_file, status) */
+                                /* TODO: better to check if its open now or not */
+                                /* TODO: build as func to make it not call cli for these */
+                                /* TODO: where is opening file target exactly */
+                                // args = ["-X", "build", "--open"];   
+                                opened = true;
+                                open_document(
+                                    env::current_dir().unwrap().join("build").join("default").join("default.pdf"),
+                                    // very awful, need to be os string, need to be flexible depending on output path and type, just mwe
+                                    status
+                                );
+                            }
+                        };
+                    // }
+                    println!("[Finished running. Exit status: {}]",exit_status.code().unwrap_or_default());
                 }
-            }
-        }
+            )),
+            triggers: hashset![
+                EventType::Create,
+                EventType::Modify,
+                EventType::Remove
+            ],
+            ignore: Some(env::current_dir().unwrap().join("build")),
+            ..Negahban::default()
+        }.watch();
+
+        Ok(0) // TODO: should add error conditions
     }
 }
 
@@ -678,5 +700,22 @@ impl ShowUserCacheDirCommand {
         let cache = Cache::get_user_default()?;
         println!("{}", cache.root().display());
         Ok(0)
+    }
+}
+
+/// Function used for displaying document
+fn open_document(out_file: PathBuf, status: &mut dyn StatusBackend) {
+    if is_config_test_mode_activated() {
+        tt_note!(status, "not opening `{}` -- test mode", out_file.display());
+    } else {
+        tt_note!(status, "opening `{}`", out_file.display());
+        if let Err(e) = open::that(&out_file) {
+            tt_error!(
+                status,
+                "failed to open `{}` with system handler",
+                out_file.display();
+                e.into()
+            )
+        }
     }
 }
